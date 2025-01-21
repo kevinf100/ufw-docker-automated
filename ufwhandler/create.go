@@ -13,36 +13,95 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func checkIP(ip string) bool {
-	return net.ParseIP(ip) != nil
+func checkIP(ip string) (bool, bool) {
+	ipParsed := net.ParseIP(ip)
+	validIP := ipParsed != nil
+	isIPv6 := validIP && ipParsed.To4() == nil
+	return net.ParseIP(ip) != nil, isIPv6
 }
 
-func checkCIDR(cidr string) bool {
-	_, _, err := net.ParseCIDR(cidr)
-	return err == nil
+func checkCIDR(cidr string) (bool, bool) {
+	ipParsed, _, err := net.ParseCIDR(cidr)
+	validIP := err == nil
+	isIPv6 := validIP && ipParsed.To4() == nil
+	return err == nil, isIPv6
+}
+
+func createAllowInRules(ufwRules *[]UfwRule, containerIPs *map[string]string, containerName string, containerID string) {
+	for _, rule := range *ufwRules {
+		for dnetwork, containerIP := range *containerIPs {
+			// Checking if an IP Exists
+			if containerIP == "" {
+				continue
+			}
+			cmd := exec.Command("sudo", "ufw", "route", "allow", "proto", rule.Proto, "from", rule.CIDR, "to", containerIP, "port", rule.Port, "comment", containerName+":"+containerID+rule.Comment)
+			log.Info().Msg("ufw-docker-automated: Adding inbound rule (docker network :" + dnetwork + "): " + cmd.String())
+
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+
+			if err != nil || stderr.String() != "" {
+				log.Error().Err(err).Msg("ufw error: " + stderr.String())
+			} else {
+				log.Info().Msg("ufw: " + stdout.String())
+			}
+		}
+	}
+}
+
+func createAllowToRules(ufwRules *[]UfwRule, containerIPs *map[string]string, containerName string, containerID string) {
+	for _, rule := range *ufwRules {
+		var cmd *exec.Cmd
+
+		for dnetwork, containerIP := range *containerIPs {
+			// Checking if an IP Exists
+			if containerIP == "" {
+				continue
+			}
+			if rule.Port == "" {
+				cmd = exec.Command("sudo", "ufw", "route", "allow", "from", containerIP, "to", rule.CIDR, "comment", containerName+":"+containerID+rule.Comment)
+			} else {
+				cmd = exec.Command("sudo", "ufw", "route", "allow", "from", containerIP, "to", rule.CIDR, "port", rule.Port, "comment", containerName+":"+containerID+rule.Comment)
+			}
+			log.Info().Msg("ufw-docker-automated: Adding outbound rule (docker network :" + dnetwork + "): " + cmd.String())
+
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+
+			if err != nil || stderr.String() != "" {
+				log.Error().Err(err).Msg("ufw error: " + stderr.String())
+			} else {
+				log.Info().Msg("ufw: " + stdout.String())
+			}
+		}
+	}
 }
 
 func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 	for container := range ch {
 		containerName := strings.Replace(container.Name, "/", "", 1) // container name appears with prefix "/"
 		containerID := container.ID[:12]
-		containerIPs := map[string]string{}
-		containerIPV6s := map[string]string{}
+		containerIPv4s := map[string]string{}
+		containerIPv6s := map[string]string{}
 		// Works for both docker-compose and docker run
 		for networkName, network := range container.NetworkSettings.Networks {
-			containerIPs[networkName] = network.IPAddress
-			containerIPV6s[networkName] = network.GlobalIPv6Address
+			containerIPv4s[networkName] = network.IPAddress
+			containerIPv6s[networkName] = network.GlobalIPv6Address
 		}
 
-		if len(containerIPs) == 0 || len(containerIPV6s) == 0 {
+		if len(containerIPv4s) == 0 || len(containerIPv6s) == 0 {
 			log.Error().Msg("ufw-docker-automated: Couldn't detect the container IP address.")
 			continue
 		}
 
 		cachedContainer := TrackedContainer{
 			Name:           containerName,
-			IPAddressMap:   containerIPs,
-			IPAddressMapV6: containerIPV6s,
+			IPAddressMap:   containerIPv4s,
+			IPAddressMapV6: containerIPv6s,
 			Labels:         container.Config.Labels,
 		}
 
@@ -53,7 +112,7 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 
 			// List is non empty if port is published
 			if len(portMaps) > 0 {
-				ufwRules := []UfwRule{}
+				ufwRulesV4 := []UfwRule{}
 				ufwRulesV6 := []UfwRule{}
 				if container.Config.Labels["UFW_ALLOW_FROM"] != "" {
 					ufwAllowFromLabelParsed := strings.Split(container.Config.Labels["UFW_ALLOW_FROM"], ";")
@@ -62,17 +121,19 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 						ip := strings.Split(allowFrom, "-")
 
 						// First element should be always valid IP Address or CIDR
-						if !checkIP(ip[0]) {
-							if !checkCIDR(ip[0]) {
+						validIP, isIPv6 := checkIP(ip[0])
+						if !validIP {
+							validIP, isIPv6 = checkCIDR(ip[0])
+							if !validIP {
 								log.Printf("ufw-docker-automated: Address %s is not valid!\n", ip[0])
 								continue
 							}
 						}
 						var ufwRuleToUse *[]UfwRule
-						if strings.Contains(ip[0], ":") {
+						if isIPv6 {
 							ufwRuleToUse = &ufwRulesV6
 						} else {
-							ufwRuleToUse = &ufwRules
+							ufwRuleToUse = &ufwRulesV4
 						}
 
 						// Example: 172.10.5.0-LAN or 172.10.5.0-80
@@ -93,47 +154,14 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 						}
 					}
 				} else {
-					ufwRules = append(ufwRules, UfwRule{CIDR: "any", Port: port.Port(), Proto: port.Proto()})
+					ufwRulesV4 = append(ufwRulesV4, UfwRule{CIDR: "any", Port: port.Port(), Proto: port.Proto()})
 					ufwRulesV6 = append(ufwRulesV6, UfwRule{CIDR: "any", Port: port.Port(), Proto: port.Proto()})
 				}
 
-				for _, rule := range ufwRules {
-					for dnetwork, containerIP := range containerIPs {
-						cmd := exec.Command("sudo", "ufw", "route", "allow", "proto", rule.Proto, "from", rule.CIDR, "to", containerIP, "port", rule.Port, "comment", containerName+":"+containerID+rule.Comment)
-						log.Info().Msg("ufw-docker-automated: Adding inbound rule (docker network :" + dnetwork + "): " + cmd.String())
+				createAllowInRules(&ufwRulesV4, &containerIPv4s, containerName, containerID)
+				createAllowInRules(&ufwRulesV6, &containerIPv6s, containerName, containerID)
 
-						var stdout, stderr bytes.Buffer
-						cmd.Stdout = &stdout
-						cmd.Stderr = &stderr
-						err := cmd.Run()
-
-						if err != nil || stderr.String() != "" {
-							log.Error().Err(err).Msg("ufw error: " + stderr.String())
-						} else {
-							log.Info().Msg("ufw: " + stdout.String())
-						}
-					}
-				}
-
-				for _, rule := range ufwRulesV6 {
-					for dnetwork, containerIPv6 := range containerIPV6s {
-						cmd := exec.Command("sudo", "ufw", "route", "allow", "proto", rule.Proto, "from", rule.CIDR, "to", containerIPv6, "port", rule.Port, "comment", containerName+":"+containerID+rule.Comment)
-						log.Info().Msg("ufw-docker-automated: Adding inbound rule (docker network :" + dnetwork + "): " + cmd.String())
-
-						var stdout, stderr bytes.Buffer
-						cmd.Stdout = &stdout
-						cmd.Stderr = &stderr
-						err := cmd.Run()
-
-						if err != nil || stderr.String() != "" {
-							log.Error().Err(err).Msg("ufw error: " + stderr.String())
-						} else {
-							log.Info().Msg("ufw: " + stdout.String())
-						}
-					}
-				}
-
-				cachedContainer.UfwInboundRules = append(cachedContainer.UfwInboundRules, ufwRules...)
+				cachedContainer.UfwInboundRules = append(cachedContainer.UfwInboundRules, ufwRulesV4...)
 				cachedContainer.UfwInboundRules = append(cachedContainer.UfwInboundRules, ufwRulesV6...)
 				// ufw route allow proto tcp from any to 172.17.0.2 port 80 comment "Comment"
 				// ufw route allow proto <tcp|udp> <source> to <container_ip> port <port> comment <comment>
@@ -146,67 +174,56 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 		if container.Config.Labels["UFW_DENY_OUT"] == "TRUE" {
 
 			if container.Config.Labels["UFW_ALLOW_TO"] != "" {
-				ufwRules := []UfwRule{}
+				ufwRulesV4 := []UfwRule{}
+				ufwRulesV6 := []UfwRule{}
 				ufwAllowToLabelParsed := strings.Split(container.Config.Labels["UFW_ALLOW_TO"], ";")
 
 				for _, allowTo := range ufwAllowToLabelParsed {
 					ip := strings.Split(allowTo, "-")
 
 					// First element should be always valid IP Address or CIDR
-					if !checkIP(ip[0]) {
-						if !checkCIDR(ip[0]) {
+					validIP, isIPv6 := checkIP(ip[0])
+					if !validIP {
+						validIP, isIPv6 = checkCIDR(ip[0])
+						if !validIP {
 							log.Printf("ufw-docker-automated: Address %s is not valid!\n", ip[0])
 							continue
 						}
+					}
+					var ufwRuleToUse *[]UfwRule
+					if isIPv6 {
+						ufwRuleToUse = &ufwRulesV6
+					} else {
+						ufwRuleToUse = &ufwRulesV4
 					}
 
 					// Example: 172.10.5.0-LAN or 172.10.5.0-80
 					if len(ip) == 2 {
 						if _, err := strconv.Atoi(ip[1]); err == nil {
 							// case: 172.10.5.0-80
-							ufwRules = append(ufwRules, UfwRule{CIDR: ip[0], Port: ip[1]})
+							*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Port: ip[1]})
 						} else {
 							// case: 172.10.5.0-LAN
-							ufwRules = append(ufwRules, UfwRule{CIDR: ip[0], Comment: fmt.Sprintf(" %s", ip[1])})
+							*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Comment: fmt.Sprintf(" %s", ip[1])})
 						}
 						// Example: 172.10.5.0-80-LAN
 					} else if len(ip) == 3 {
-						ufwRules = append(ufwRules, UfwRule{CIDR: ip[0], Port: ip[1], Comment: fmt.Sprintf(" %s", ip[2])})
+						*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Port: ip[1], Comment: fmt.Sprintf(" %s", ip[2])})
 					} else {
 						// Example: 172.10.5.0
-						ufwRules = append(ufwRules, UfwRule{CIDR: ip[0]})
+						*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0]})
 					}
 				}
 
-				for _, rule := range ufwRules {
-					var cmd *exec.Cmd
+				createAllowToRules(&ufwRulesV4, &containerIPv4s, containerName, containerID)
+				createAllowToRules(&ufwRulesV6, &containerIPv6s, containerName, containerID)
 
-					for dnetwork, containerIP := range containerIPs {
-						if rule.Port == "" {
-							cmd = exec.Command("sudo", "ufw", "route", "allow", "from", containerIP, "to", rule.CIDR, "comment", containerName+":"+containerID+rule.Comment)
-						} else {
-							cmd = exec.Command("sudo", "ufw", "route", "allow", "from", containerIP, "to", rule.CIDR, "port", rule.Port, "comment", containerName+":"+containerID+rule.Comment)
-						}
-						log.Info().Msg("ufw-docker-automated: Adding outbound rule (docker network :" + dnetwork + "): " + cmd.String())
-
-						var stdout, stderr bytes.Buffer
-						cmd.Stdout = &stdout
-						cmd.Stderr = &stderr
-						err := cmd.Run()
-
-						if err != nil || stderr.String() != "" {
-							log.Error().Err(err).Msg("ufw error: " + stderr.String())
-						} else {
-							log.Info().Msg("ufw: " + stdout.String())
-						}
-					}
-				}
-
-				cachedContainer.UfwOutboundRules = append(cachedContainer.UfwOutboundRules, ufwRules...)
+				cachedContainer.UfwOutboundRules = append(cachedContainer.UfwOutboundRules, ufwRulesV4...)
+				cachedContainer.UfwOutboundRules = append(cachedContainer.UfwOutboundRules, ufwRulesV6...)
 			}
 
 			// Handle deny all out
-			for dnetwork, containerIP := range containerIPs {
+			for dnetwork, containerIP := range containerIPv4s {
 				cmd := exec.Command("sudo", "ufw", "route", "deny", "from", containerIP, "to", "any", "comment", containerName+":"+containerID)
 				log.Info().Msg("ufw-docker-automated: Adding outbound rule (docker network :" + dnetwork + "): " + cmd.String())
 
