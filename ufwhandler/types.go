@@ -3,6 +3,7 @@ package ufwhandler
 type TrackedContainer struct {
 	Name             string
 	IPAddressMap     map[string]string
+	IPAddressMapV6   map[string]string
 	Labels           map[string]string
 	UfwInboundRules  []UfwRule
 	UfwOutboundRules []UfwRule
