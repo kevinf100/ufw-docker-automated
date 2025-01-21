@@ -51,7 +51,7 @@ func createAllowInRules(ufwRules *[]UfwRule, containerIPs *map[string]string, co
 	}
 }
 
-func createAllowToRules(ufwRules *[]UfwRule, containerIPs *map[string]string, containerName string, containerID string) {
+func createAllowOutRules(ufwRules *[]UfwRule, containerIPs *map[string]string, containerName string, containerID string) {
 	for _, rule := range *ufwRules {
 		var cmd *exec.Cmd
 
@@ -81,6 +81,24 @@ func createAllowToRules(ufwRules *[]UfwRule, containerIPs *map[string]string, co
 	}
 }
 
+func createDenyOutRules(containerIPs *map[string]string, containerName string, containerID string) {
+	for dnetwork, containerIP := range *containerIPs {
+		cmd := exec.Command("sudo", "ufw", "route", "deny", "from", containerIP, "to", "any", "comment", containerName+":"+containerID)
+		log.Info().Msg("ufw-docker-automated: Adding outbound rule (docker network :" + dnetwork + "): " + cmd.String())
+
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+
+		if err != nil || stderr.String() != "" {
+			log.Error().Err(err).Msg("ufw error: " + stderr.String())
+		} else {
+			log.Info().Msg("ufw: " + stdout.String())
+		}
+	}
+}
+
 func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 	for container := range ch {
 		containerName := strings.Replace(container.Name, "/", "", 1) // container name appears with prefix "/"
@@ -100,7 +118,7 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 
 		cachedContainer := TrackedContainer{
 			Name:           containerName,
-			IPAddressMap:   containerIPv4s,
+			IPAddressMapV4: containerIPv4s,
 			IPAddressMapV6: containerIPv6s,
 			Labels:         container.Config.Labels,
 		}
@@ -161,8 +179,8 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 				createAllowInRules(&ufwRulesV4, &containerIPv4s, containerName, containerID)
 				createAllowInRules(&ufwRulesV6, &containerIPv6s, containerName, containerID)
 
-				cachedContainer.UfwInboundRules = append(cachedContainer.UfwInboundRules, ufwRulesV4...)
-				cachedContainer.UfwInboundRules = append(cachedContainer.UfwInboundRules, ufwRulesV6...)
+				cachedContainer.UfwInboundRulesV4 = append(cachedContainer.UfwInboundRulesV4, ufwRulesV4...)
+				cachedContainer.UfwInboundRulesV6 = append(cachedContainer.UfwInboundRulesV6, ufwRulesV6...)
 				// ufw route allow proto tcp from any to 172.17.0.2 port 80 comment "Comment"
 				// ufw route allow proto <tcp|udp> <source> to <container_ip> port <port> comment <comment>
 				// ufw route delete allow proto tcp from any to 172.17.0.2 port 80 comment "Comment"
@@ -215,29 +233,16 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 					}
 				}
 
-				createAllowToRules(&ufwRulesV4, &containerIPv4s, containerName, containerID)
-				createAllowToRules(&ufwRulesV6, &containerIPv6s, containerName, containerID)
+				createAllowOutRules(&ufwRulesV4, &containerIPv4s, containerName, containerID)
+				createAllowOutRules(&ufwRulesV6, &containerIPv6s, containerName, containerID)
 
-				cachedContainer.UfwOutboundRules = append(cachedContainer.UfwOutboundRules, ufwRulesV4...)
-				cachedContainer.UfwOutboundRules = append(cachedContainer.UfwOutboundRules, ufwRulesV6...)
+				cachedContainer.UfwOutboundRulesV4 = append(cachedContainer.UfwOutboundRulesV4, ufwRulesV4...)
+				cachedContainer.UfwOutboundRulesV6 = append(cachedContainer.UfwOutboundRulesV6, ufwRulesV6...)
 			}
 
 			// Handle deny all out
-			for dnetwork, containerIP := range containerIPv4s {
-				cmd := exec.Command("sudo", "ufw", "route", "deny", "from", containerIP, "to", "any", "comment", containerName+":"+containerID)
-				log.Info().Msg("ufw-docker-automated: Adding outbound rule (docker network :" + dnetwork + "): " + cmd.String())
-
-				var stdout, stderr bytes.Buffer
-				cmd.Stdout = &stdout
-				cmd.Stderr = &stderr
-				err := cmd.Run()
-
-				if err != nil || stderr.String() != "" {
-					log.Error().Err(err).Msg("ufw error: " + stderr.String())
-				} else {
-					log.Info().Msg("ufw: " + stdout.String())
-				}
-			}
+			createDenyOutRules(&containerIPv4s, containerName, containerID)
+			createDenyOutRules(&containerIPv6s, containerName, containerID)
 		}
 	}
 }
