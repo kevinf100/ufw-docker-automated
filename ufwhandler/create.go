@@ -111,7 +111,7 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 			containerIPv6s[networkName] = network.GlobalIPv6Address
 		}
 
-		if len(containerIPv4s) == 0 || len(containerIPv6s) == 0 {
+		if len(containerIPv4s) == 0 && len(containerIPv6s) == 0 {
 			log.Error().Msg("ufw-docker-automated: Couldn't detect the container IP address.")
 			continue
 		}
@@ -155,19 +155,24 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 						}
 
 						// Example: 172.10.5.0-LAN or 172.10.5.0-80
+						//          fe80::1-Lan or fe80::1-80
 						if len(ip) == 2 {
 							if _, err := strconv.Atoi(ip[1]); err == nil {
 								// case: 172.10.5.0-80
+								// case: fe80::1-80
 								*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Port: ip[1], Proto: port.Proto()})
 							} else {
 								// case: 172.10.5.0-LAN
+								// case: fe80::1-Lan
 								*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Port: port.Port(), Proto: port.Proto(), Comment: fmt.Sprintf(" %s", ip[1])})
 							}
 							// Example: 172.10.5.0-80-LAN
+							// Example: fe80::1-80-Lan
 						} else if len(ip) == 3 {
 							*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Port: ip[1], Proto: port.Proto(), Comment: fmt.Sprintf(" %s", ip[2])})
 						} else {
 							// Example: 172.10.5.0
+							// Example: fe80::1-80
 							*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Port: port.Port(), Proto: port.Proto()})
 						}
 					}
@@ -176,9 +181,11 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 					ufwRulesV6 = append(ufwRulesV6, UfwRule{CIDR: "any", Port: port.Port(), Proto: port.Proto()})
 				}
 
+				// Seperate IPv4 and v6 incase if we ever need to do them diffrently.
 				createAllowInRules(&ufwRulesV4, &containerIPv4s, containerName, containerID)
 				createAllowInRules(&ufwRulesV6, &containerIPv6s, containerName, containerID)
 
+				// Seperate rules for deleting later.
 				cachedContainer.UfwInboundRulesV4 = append(cachedContainer.UfwInboundRulesV4, ufwRulesV4...)
 				cachedContainer.UfwInboundRulesV6 = append(cachedContainer.UfwInboundRulesV6, ufwRulesV6...)
 				// ufw route allow proto tcp from any to 172.17.0.2 port 80 comment "Comment"
@@ -216,26 +223,33 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 					}
 
 					// Example: 172.10.5.0-LAN or 172.10.5.0-80
+					//          fe80::1-Lan or fe80::1-80
 					if len(ip) == 2 {
 						if _, err := strconv.Atoi(ip[1]); err == nil {
 							// case: 172.10.5.0-80
+							// case: fe80::1-80
 							*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Port: ip[1]})
 						} else {
 							// case: 172.10.5.0-LAN
+							// case: fe80::1-LAN
 							*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Comment: fmt.Sprintf(" %s", ip[1])})
 						}
 						// Example: 172.10.5.0-80-LAN
+						// Example: fe80::1-80-Lan
 					} else if len(ip) == 3 {
 						*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0], Port: ip[1], Comment: fmt.Sprintf(" %s", ip[2])})
 					} else {
 						// Example: 172.10.5.0
+						// Example: fe80::1
 						*ufwRuleToUse = append(*ufwRuleToUse, UfwRule{CIDR: ip[0]})
 					}
 				}
 
+				// Seperate IPv4 and v6 incase if we ever need to do them diffrently.
 				createAllowOutRules(&ufwRulesV4, &containerIPv4s, containerName, containerID)
 				createAllowOutRules(&ufwRulesV6, &containerIPv6s, containerName, containerID)
 
+				// Seperate rules for deleting later.
 				cachedContainer.UfwOutboundRulesV4 = append(cachedContainer.UfwOutboundRulesV4, ufwRulesV4...)
 				cachedContainer.UfwOutboundRulesV6 = append(cachedContainer.UfwOutboundRulesV6, ufwRulesV6...)
 			}
